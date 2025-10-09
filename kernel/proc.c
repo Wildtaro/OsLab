@@ -354,7 +354,6 @@ void exit(int status) {
   struct proc *pp;
   int child_num = 0;
   for (pp = proc; pp < &proc[NPROC]; pp++) {
-    // 检查当前遍历进程pp是否是进程p的子进程
     if (pp->parent == p) {
       char *child_state;
       if (pp->state >= 0 && pp->state < NELEM(states) && states[pp->state])
