@@ -429,7 +429,7 @@ int wait(uint64 addr, int flags) {
       return -1;
     }
 
-        // 如果flags为1，表示非阻塞等待，直接返回-1
+    // 如果flags为1，表示非阻塞等待，直接返回-1
     if (flags == 1) {
       release(&p->lock);
       return -1;
