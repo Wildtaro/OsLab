@@ -15,6 +15,8 @@ extern char etext[];  // kernel.ld sets this to end of kernel code.
 
 extern char trampoline[];  // trampoline.S
 
+void freewalk(pagetable_t pagetable);
+
 /*
  * create a direct-map page table for the kernel.
  */
@@ -43,6 +45,122 @@ void kvminit() {
   // map the trampoline for trap entry/exit to
   // the highest virtual address in the kernel.
   kvmmap(TRAMPOLINE, (uint64)trampoline, PGSIZE, PTE_R | PTE_X);
+}
+
+// 为进程创建独立的内核页表（不包含CLINT映射）
+pagetable_t proc_kvminit() {
+  pagetable_t kpgtbl = (pagetable_t)kalloc();
+  if (kpgtbl == 0) return 0;
+  memset(kpgtbl, 0, PGSIZE);
+
+  // uart registers
+  if (mappages(kpgtbl, UART0, PGSIZE, UART0, PTE_R | PTE_W) != 0) goto err;
+
+  // virtio mmio disk interface
+  if (mappages(kpgtbl, VIRTIO0, PGSIZE, VIRTIO0, PTE_R | PTE_W) != 0) goto err;
+
+  // 注意：不映射CLINT，避免地址冲突
+
+  // PLIC
+  if (mappages(kpgtbl, PLIC, 0x400000, PLIC, PTE_R | PTE_W) != 0) goto err;
+
+  // kernel text executable and read-only
+  if (mappages(kpgtbl, KERNBASE, (uint64)etext - KERNBASE, KERNBASE, PTE_R | PTE_X) != 0) goto err;
+
+  // kernel data and physical RAM
+  if (mappages(kpgtbl, (uint64)etext, PHYSTOP - (uint64)etext, (uint64)etext, PTE_R | PTE_W) != 0) goto err;
+
+  // trampoline
+  if (mappages(kpgtbl, TRAMPOLINE, PGSIZE, (uint64)trampoline, PTE_R | PTE_X) != 0) goto err;
+
+  return kpgtbl;
+
+err:
+  // 释放页表但不释放物理页
+  freewalk(kpgtbl);
+  return 0;
+}
+
+// 释放进程的内核页表，但不释放物理页，且避免释放共享的用户L0页表
+void proc_freekpagetable(pagetable_t kpgtbl) {
+  int user_l1_lim = PLIC >> PXSHIFT(1);  // PLIC 覆盖到的 L1 项数（2MB 粒度）
+
+  for (int i = 0; i < 512; i++) {
+    pte_t pte = kpgtbl[i];
+    if ((pte & PTE_V) && (pte & (PTE_R | PTE_W | PTE_X)) == 0) {
+      // 中间层页表
+      uint64 child = PTE2PA(pte);
+      if (i == PX(2, 0)) {
+        // L2[0] -> L1：前 user_l1_lim 项共享用户的 L0，不能递归释放
+        pagetable_t kl1 = (pagetable_t)child;
+
+        // 清理 [0, user_l1_lim) 区间的 PTE 引用（不递归）
+        for (int j = 0; j < user_l1_lim; j++) kl1[j] = 0;
+
+        // 对剩余项正常递归释放（这些属于纯内核映射，如 PLIC 及以上）
+        for (int j = user_l1_lim; j < 512; j++) {
+          pte_t pte1 = kl1[j];
+          if ((pte1 & PTE_V) && (pte1 & (PTE_R | PTE_W | PTE_X)) == 0) {
+            proc_freekpagetable((pagetable_t)PTE2PA(pte1));
+            kl1[j] = 0;
+          } else if (pte1 & PTE_V) {
+            // 叶子：只清掉映射
+            kl1[j] = 0;
+          }
+        }
+        kfree((void *)kl1);
+        kpgtbl[i] = 0;
+      } else {
+        // 其他中间节点：递归释放
+        proc_freekpagetable((pagetable_t)child);
+        kpgtbl[i] = 0;
+      }
+    } else if (pte & PTE_V) {
+      // 叶子节点：只清除PTE，不释放物理页
+      kpgtbl[i] = 0;
+    }
+  }
+  // 最后释放页表本身
+  kfree((void *)kpgtbl);
+}
+
+// 将用户页表 [0, PLIC) 的 L1 目录项同步到内核页表，指向相同的 L0（共享叶子页表）
+int sync_pagetable(pagetable_t pagetable, pagetable_t kpagetable) {
+  // 计算用户空间在 L1 的覆盖项数（每项 2MB）
+  int user_l1_lim = PLIC >> PXSHIFT(1);  // 0x0c000000 >> 21 = 96
+
+  // 确保内核 L2[0] 存在且为中间节点
+  pte_t *k_l2e = &kpagetable[PX(2, 0)];
+  pagetable_t k_l1;
+  if ((*k_l2e & PTE_V) == 0 || (*k_l2e & (PTE_R | PTE_W | PTE_X)) != 0) {
+    k_l1 = (pagetable_t)kalloc();
+    if (k_l1 == 0) return -1;
+    memset(k_l1, 0, PGSIZE);
+    *k_l2e = PA2PTE(k_l1) | PTE_V;  // 中间节点
+  } else {
+    k_l1 = (pagetable_t)PTE2PA(*k_l2e);
+  }
+
+  // 读取用户 L2[0] -> L1
+  pte_t u_l2e = pagetable[PX(2, 0)];
+  pagetable_t u_l1 = 0;
+  if (u_l2e & PTE_V) {
+    // 只能是中间节点
+    u_l1 = (pagetable_t)PTE2PA(u_l2e);
+  }
+
+  // 同步前 user_l1_lim 项：将内核 L1 的对应项复制为用户 L1 的项（共享到相同 L0）
+  for (int j = 0; j < user_l1_lim; j++) {
+    if (u_l1) {
+      k_l1[j] = u_l1[j];
+    } else {
+      k_l1[j] = 0;
+    }
+  }
+
+  // 刷新 TLB，使得后续访问可见
+  sfence_vma();
+  return 0;
 }
 
 // Switch h/w page table register to the kernel's page table,
@@ -316,21 +434,11 @@ int copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len) {
 // Copy len bytes to dst from virtual address srcva in a given page table.
 // Return 0 on success, -1 on error.
 int copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len) {
-  uint64 n, va0, pa0;
-
-  while (len > 0) {
-    va0 = PGROUNDDOWN(srcva);
-    pa0 = walkaddr(pagetable, va0);
-    if (pa0 == 0) return -1;
-    n = PGSIZE - (srcva - va0);
-    if (n > len) n = len;
-    memmove(dst, (void *)(pa0 + (srcva - va0)), n);
-
-    len -= n;
-    dst += n;
-    srcva = va0 + PGSIZE;
-  }
-  return 0;
+  uint64 s = r_sstatus();
+  w_sstatus(s | SSTATUS_SUM);
+  int r = copyin_new(pagetable, dst, srcva, len);
+  w_sstatus(s);
+  return r;
 }
 
 // Copy a null-terminated string from user to kernel.
@@ -338,38 +446,52 @@ int copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len) {
 // until a '\0', or max.
 // Return 0 on success, -1 on error.
 int copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max) {
-  uint64 n, va0, pa0;
-  int got_null = 0;
+  uint64 s = r_sstatus();
+  w_sstatus(s | SSTATUS_SUM);
+  int r = copyinstr_new(pagetable, dst, srcva, max);
+  w_sstatus(s);
+  return r;
+}
 
-  while (got_null == 0 && max > 0) {
-    va0 = PGROUNDDOWN(srcva);
-    pa0 = walkaddr(pagetable, va0);
-    if (pa0 == 0) return -1;
-    n = PGSIZE - (srcva - va0);
-    if (n > max) n = max;
+// 递归打印页表项
+// pagetable: 当前页表的物理地址
+// level: 当前页表的层级 (2, 1, 0)
+// va_prefix: 上层构建的虚拟地址前缀
+void vmprint_recursive(pagetable_t pagetable, int level, uint64 va_prefix) {
+  for (int i = 0; i < 512; i++) {
+    pte_t pte = pagetable[i];
 
-    char *p = (char *)(pa0 + (srcva - va0));
-    while (n > 0) {
-      if (*p == '\0') {
-        *dst = '\0';
-        got_null = 1;
-        break;
-      } else {
-        *dst = *p;
+    // 只打印有效的PTE
+    if (pte & PTE_V) {
+      // 打印缩进
+      for (int l = 2; l > level; l--) {
+        printf("||   ");
       }
-      --n;
-      --max;
-      p++;
-      dst++;
-    }
+      printf("||");
 
-    srcva = va0 + PGSIZE;
+      // 检查PTE是否为叶子节点
+      if ((pte & (PTE_R | PTE_W | PTE_X)) != 0) {
+        // 叶子节点
+        uint64 va = va_prefix | ((uint64)i << (12 + 9 * level));
+        printf("idx: %d: va: %p -> pa: %p, flags: %s%s%s%s\n", i, va, PTE2PA(pte), (pte & PTE_R) ? "r" : "-",
+               (pte & PTE_W) ? "w" : "-", (pte & PTE_X) ? "x" : "-", (pte & PTE_U) ? "u" : "-");
+      } else {
+        // 中间节点 (指向下一级页表)
+        printf("idx: %d: pa: %p, flags: ----\n", i, PTE2PA(pte));
+
+        // 递归进入下一层
+        uint64 next_va_prefix = va_prefix | ((uint64)i << (12 + 9 * level));
+        pagetable_t child_pgtbl = (pagetable_t)PTE2PA(pte);
+        vmprint_recursive(child_pgtbl, level - 1, next_va_prefix);
+      }
+    }
   }
-  if (got_null) {
-    return 0;
-  } else {
-    return -1;
-  }
+}
+
+void vmprint(pagetable_t pagetable) {
+  printf("page table %p\n", pagetable);
+  // 从最高层(level 2)开始递归，虚拟地址前缀为0
+  vmprint_recursive(pagetable, 2, 0);
 }
 
 // check if use global kpgtbl or not
