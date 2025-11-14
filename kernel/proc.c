@@ -36,8 +36,7 @@ void procinit(void) {
     if (pa == 0) panic("kalloc");
     uint64 va = KSTACK((int)(p - proc));
 
-    // 保存内核栈物理地址到PCB
-    p->kstack_pa = (uint64)pa;
+    p->kstack_pa = (uint64)pa;// 保存内核栈物理地址到PCB
 
     kvmmap(va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
     p->kstack = va;
@@ -229,8 +228,7 @@ void userinit(void) {
   safestrcpy(p->name, "initcode", sizeof(p->name));
   p->cwd = namei("/");
 
-  // 将用户页表 [0, PLIC) 同步到该进程的独立内核页表
-  (void)sync_pagetable(p->pagetable, p->k_pagetable);
+  (void)sync_pagetable(p->pagetable, p->k_pagetable);// 将用户页表 [0, PLIC) 同步到该进程的独立内核页表
 
   p->state = RUNNABLE;
 
